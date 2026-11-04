@@ -92,6 +92,17 @@ std::string ToHex(const std::vector<uint8_t>& data) {
 std::string ExtractXmlTag(const std::string& xml, const std::string& tag, size_t startPos = 0, size_t* outEndPos = nullptr) {
     std::string openTag = "<" + tag;
     size_t open = xml.find(openTag, startPos);
+    auto isMediaTag = [&](size_t at) {
+        size_t after = at + openTag.size();
+        return after < xml.size() &&
+            (xml[after] == '>' || xml[after] == '/' || xml[after] == ' ' ||
+             xml[after] == '\t' || xml[after] == '\r' || xml[after] == '\n');
+    };
+    if (tag == "media") {
+        while (open != std::string::npos && !isMediaTag(open)) {
+            open = xml.find(openTag, open + openTag.size());
+        }
+    }
     if (open == std::string::npos) return "";
     size_t tagEnd = xml.find('>', open);
     if (tagEnd == std::string::npos) return "";
@@ -101,6 +112,18 @@ std::string ExtractXmlTag(const std::string& xml, const std::string& tag, size_t
     }
     std::string closeTag = "</" + tag + ">";
     size_t close = xml.find(closeTag, tagEnd);
+    // LivePhoto can contain a nested <media>; do not end the parent at its close.
+    if (tag == "media") {
+        size_t nested = xml.find(openTag, tagEnd + 1);
+        while (close != std::string::npos && nested != std::string::npos && nested < close) {
+            size_t nestedEnd = xml.find('>', nested);
+            if (nestedEnd == std::string::npos) return "";
+            if (isMediaTag(nested) && xml[nestedEnd - 1] != '/') {
+                close = xml.find(closeTag, close + closeTag.size());
+            }
+            nested = xml.find(openTag, nestedEnd + 1);
+        }
+    }
     if (close == std::string::npos) return "";
     if (outEndPos) *outEndPos = close + closeTag.size();
     return xml.substr(tagEnd + 1, close - tagEnd - 1);
@@ -159,6 +182,8 @@ void ParseMediaList(const std::string& xml, std::vector<ExtractedMedia>& outMedi
             if (endUrlTag != std::string::npos) {
                 std::string header = mediaXml.substr(urlTagPos, endUrlTag - urlTagPos);
                 m.token = ExtractXmlAttr(header, "token");
+                m.key = ExtractXmlAttr(header, "key");
+                m.md5 = ExtractXmlAttr(header, "md5");
                 m.encIdx = ExtractXmlAttr(header, "enc_idx");
                 if (m.encIdx.empty()) m.encIdx = ExtractXmlAttr(header, "encIdx");
             }
@@ -171,11 +196,17 @@ void ParseMediaList(const std::string& xml, std::vector<ExtractedMedia>& outMedi
             if (endThumbTag != std::string::npos) {
                 std::string header = mediaXml.substr(thumbTagPos, endThumbTag - thumbTagPos);
                 m.thumbToken = ExtractXmlAttr(header, "token");
+                if (m.key.empty()) m.key = ExtractXmlAttr(header, "key");
+                if (m.md5.empty()) m.md5 = ExtractXmlAttr(header, "md5");
+                if (m.encIdx.empty()) m.encIdx = ExtractXmlAttr(header, "enc_idx");
+                if (m.encIdx.empty()) m.encIdx = ExtractXmlAttr(header, "encIdx");
             }
         }
         m.thumb = ExtractXmlTag(mediaXml, "thumb");
-        m.md5 = ExtractXmlTag(mediaXml, "md5");
-        m.key = ExtractXmlTag(mediaXml, "key");
+        // Modern clients put these on <url>/<thumb>; older data uses child tags.
+        // Keep keys as strings: ISAAC seeds can exceed JavaScript's safe integers.
+        if (m.md5.empty()) m.md5 = ExtractXmlTag(mediaXml, "md5");
+        if (m.key.empty()) m.key = ExtractXmlTag(mediaXml, "key");
 
         size_t lpPos = mediaXml.find("<LivePhoto");
         if (lpPos != std::string::npos) {
@@ -189,13 +220,28 @@ void ParseMediaList(const std::string& xml, std::vector<ExtractedMedia>& outMedi
                     if (endLUrl != std::string::npos) {
                         std::string h = subMedia.substr(lUrlPos, endLUrl - lUrlPos);
                         lpd.token = ExtractXmlAttr(h, "token");
+                        lpd.key = ExtractXmlAttr(h, "key");
+                        lpd.md5 = ExtractXmlAttr(h, "md5");
                         lpd.encIdx = ExtractXmlAttr(h, "enc_idx");
+                        if (lpd.encIdx.empty()) lpd.encIdx = ExtractXmlAttr(h, "encIdx");
+                    }
+                }
+                size_t lThumbPos = subMedia.find("<thumb");
+                if (lThumbPos != std::string::npos) {
+                    size_t endLThumb = subMedia.find('>', lThumbPos);
+                    if (endLThumb != std::string::npos) {
+                        std::string h = subMedia.substr(lThumbPos, endLThumb - lThumbPos);
+                        lpd.thumbToken = ExtractXmlAttr(h, "token");
+                        if (lpd.key.empty()) lpd.key = ExtractXmlAttr(h, "key");
+                        if (lpd.md5.empty()) lpd.md5 = ExtractXmlAttr(h, "md5");
+                        if (lpd.encIdx.empty()) lpd.encIdx = ExtractXmlAttr(h, "enc_idx");
+                        if (lpd.encIdx.empty()) lpd.encIdx = ExtractXmlAttr(h, "encIdx");
                     }
                 }
                 lpd.url = ExtractXmlTag(subMedia, "url");
                 lpd.thumb = ExtractXmlTag(subMedia, "thumb");
-                lpd.md5 = ExtractXmlTag(subMedia, "md5");
-                lpd.key = ExtractXmlTag(subMedia, "key");
+                if (lpd.md5.empty()) lpd.md5 = ExtractXmlTag(subMedia, "md5");
+                if (lpd.key.empty()) lpd.key = ExtractXmlTag(subMedia, "key");
                 m.livePhoto = lpd;
             }
         }
