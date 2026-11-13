@@ -18,13 +18,14 @@ import struct
 
 URL_PREFIX = b'QA=(e,t,n=!1)=>{if(!e)return e;let r=e.replace(`http://`,`https://`);'
 SIZE_REWRITE = br'if(!n){let[e,t]=r.split(`?`),n=e.replace(/\/(150|200|480)($|\?)/,`/0$2`);r=t?`${n}?${t}`:n}'
+MAIN_ENTRY = "dist-electron/main.js"
 
 
 def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def read_main(asar_path):
+def read_packed_entry(asar_path, entry):
     with asar_path.open("rb") as archive:
         prefix = archive.read(16)
         if len(prefix) != 16:
@@ -34,23 +35,29 @@ def read_main(asar_path):
             raise ValueError("Unsupported ASAR header layout")
         raw_header = archive.read(json_size)
         header = json.loads(raw_header)
-        meta = header["files"]["dist-electron"]["files"]["main.js"]
+        meta = header
+        for part in entry.split("/"):
+            meta = meta["files"][part]
         if meta.get("unpacked") or meta.get("link"):
-            raise ValueError("main.js must be packed in app.asar")
+            raise ValueError(f"{entry} must be packed in app.asar")
         offset = 8 + header_size + int(meta["offset"])
         archive.seek(offset)
-        main = archive.read(meta["size"])
+        payload = archive.read(meta["size"])
         integrity = meta["integrity"]
-        digest = sha256(main)
-        if len(main) != meta["size"] or integrity["algorithm"] != "SHA256":
-            raise ValueError("Invalid main.js payload metadata")
+        digest = sha256(payload)
+        if len(payload) != meta["size"] or integrity["algorithm"] != "SHA256":
+            raise ValueError(f"Invalid {entry} payload metadata")
         if integrity["hash"] != digest:
-            raise ValueError("Existing main.js integrity hash does not match its contents")
+            raise ValueError(f"Existing {entry} integrity hash does not match its contents")
         block_size = integrity["blockSize"]
-        blocks = [sha256(main[i:i + block_size]) for i in range(0, len(main), block_size)]
+        blocks = [sha256(payload[i:i + block_size]) for i in range(0, len(payload), block_size)]
         if integrity["blocks"] != blocks:
-            raise ValueError("Existing main.js block integrity does not match its contents")
-        return raw_header, meta, offset, main
+            raise ValueError(f"Existing {entry} block integrity does not match its contents")
+        return raw_header, meta, offset, payload
+
+
+def read_main(asar_path):
+    return read_packed_entry(asar_path, MAIN_ENTRY)
 
 
 def patch_main(main):
@@ -63,8 +70,8 @@ def patch_main(main):
     return main.replace(old, new, 1)
 
 
-def stage_patch(asar_path, plist_path, output_dir, check_only=False):
-    raw_header, meta, offset, main = read_main(asar_path)
+def stage_entry_patch(asar_path, plist_path, output_dir, entry, patch_entry, check_only=False):
+    raw_header, meta, offset, payload = read_packed_entry(asar_path, entry)
     plist_bytes = plist_path.read_bytes()
     info = plistlib.loads(plist_bytes)
     if info.get("CFBundleShortVersionString") != "6.3.1":
@@ -73,22 +80,24 @@ def stage_patch(asar_path, plist_path, output_dir, check_only=False):
     plist_integrity = info["ElectronAsarIntegrity"]["Resources/app.asar"]
     if plist_integrity.get("algorithm") != "SHA256" or plist_integrity.get("hash") != old_header_hash:
         raise ValueError("Existing Info.plist ASAR header hash does not match")
-    patched_main = patch_main(main)
-    if len(meta["integrity"]["blocks"]) != 1 or len(main) > meta["integrity"]["blockSize"]:
-        raise ValueError("Expected main.js to fit in one integrity block")
-    old_main_hash = meta["integrity"]["hash"].encode("ascii")
-    new_main_hash = sha256(patched_main).encode("ascii")
+    patched_payload = patch_entry(payload)
+    if len(patched_payload) != len(payload):
+        raise ValueError(f"Expected {entry} patch to preserve the payload size")
+    if len(meta["integrity"]["blocks"]) != 1:
+        raise ValueError(f"Expected {entry} to fit in one integrity block")
+    old_payload_hash = meta["integrity"]["hash"].encode("ascii")
+    new_payload_hash = sha256(patched_payload).encode("ascii")
     # In this version the payload hash and its sole block hash occur twice.
     # Fail closed if another header entry happens to share that digest.
-    if raw_header.count(old_main_hash) != 2:
-        raise ValueError("Unexpected main.js integrity hash occurrence count")
-    patched_header = raw_header.replace(old_main_hash, new_main_hash)
+    if raw_header.count(old_payload_hash) != 2:
+        raise ValueError(f"Unexpected {entry} integrity hash occurrence count")
+    patched_header = raw_header.replace(old_payload_hash, new_payload_hash)
     new_header_hash = sha256(patched_header)
     if plist_bytes.count(old_header_hash.encode("ascii")) != 1:
         raise ValueError("Expected one text ASAR hash in Info.plist")
     patched_plist = plist_bytes.replace(old_header_hash.encode("ascii"), new_header_hash.encode("ascii"), 1)
-    summary = {"main_sha256": new_main_hash.decode("ascii"), "asar_header_sha256": new_header_hash,
-               "removed_rewrite_bytes": len(SIZE_REWRITE), "archive_size_unchanged": True}
+    summary = {"payload_sha256": new_payload_hash.decode("ascii"), "asar_header_sha256": new_header_hash,
+               "archive_size_unchanged": True}
     if check_only:
         return {"check_only": True, **summary}
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -101,15 +110,22 @@ def stage_patch(asar_path, plist_path, output_dir, check_only=False):
         archive.seek(16)
         archive.write(patched_header)
         archive.seek(offset)
-        archive.write(patched_main)
+        archive.write(patched_payload)
     staged_plist.write_bytes(patched_plist)
-    verified_header, verified_meta, verified_offset, verified_main = read_main(staged_asar)
+    verified_header, verified_meta, verified_offset, verified_payload = read_packed_entry(staged_asar, entry)
     verified_info = plistlib.loads(staged_plist.read_bytes())
-    if (verified_header != patched_header or verified_main != patched_main or verified_offset != offset or
+    if (verified_header != patched_header or verified_payload != patched_payload or verified_offset != offset or
             verified_meta["size"] != meta["size"] or staged_asar.stat().st_size != asar_path.stat().st_size or
             verified_info["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"] != sha256(verified_header)):
         raise ValueError("Staged repair verification failed")
     return {"app_asar": str(staged_asar), "info_plist": str(staged_plist), **summary}
+
+
+def stage_patch(asar_path, plist_path, output_dir, check_only=False):
+    result = stage_entry_patch(asar_path, plist_path, output_dir, MAIN_ENTRY, patch_main, check_only)
+    result["main_sha256"] = result.pop("payload_sha256")
+    result["removed_rewrite_bytes"] = len(SIZE_REWRITE)
+    return result
 
 
 def main():
