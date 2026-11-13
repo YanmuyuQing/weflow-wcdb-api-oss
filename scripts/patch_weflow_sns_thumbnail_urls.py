@@ -60,6 +60,87 @@ def read_main(asar_path):
     return read_packed_entry(asar_path, MAIN_ENTRY)
 
 
+def packed_entries(header):
+    for entry in header["files"].values():
+        if "files" in entry:
+            yield from packed_entries(entry)
+        elif "offset" in entry and not entry.get("unpacked") and not entry.get("link"):
+            yield entry
+
+
+def copy_range(source, target, length):
+    while length:
+        chunk = source.read(min(1024 * 1024, length))
+        if not chunk:
+            raise ValueError("Truncated ASAR payload")
+        target.write(chunk)
+        length -= len(chunk)
+
+
+def stage_resized_entries(asar_path, plist_path, output_dir, patches, check_only=False):
+    """Stage changed payloads and rebase subsequent packed offsets."""
+    original_entries = {entry: read_packed_entry(asar_path, entry) for entry in patches}
+    raw_header, first_meta, first_start, _ = next(iter(original_entries.values()))
+    payload_start = first_start - int(first_meta["offset"])
+    info = plistlib.loads(plist_path.read_bytes())
+    plist_integrity = info["ElectronAsarIntegrity"]["Resources/app.asar"]
+    if (info.get("CFBundleShortVersionString") != "6.3.1" or
+            plist_integrity != {"algorithm": "SHA256", "hash": sha256(raw_header)}):
+        raise ValueError("Expected WeFlow 6.3.1 with valid ASAR header integrity")
+
+    header = json.loads(raw_header)
+    edits = {}
+    digests = {}
+    for entry, patch in patches.items():
+        _, meta, _, payload = original_entries[entry]
+        patched = patch(payload)
+        edits[int(meta["offset"])] = (len(payload), patched)
+        digests[entry] = sha256(patched)
+    shift = 0
+    for entry in sorted(packed_entries(header), key=lambda item: (int(item["offset"]), item["size"])):
+        offset = int(entry["offset"])
+        entry["offset"] = str(offset + shift)
+        if offset not in edits or not entry["size"]:
+            continue
+        old_size, payload = edits[offset]
+        if entry["size"] != old_size:
+            raise ValueError("Overlapping ASAR entries")
+        entry["size"] = len(payload)
+        integrity = entry["integrity"]
+        integrity["hash"] = sha256(payload)
+        block_size = integrity["blockSize"]
+        integrity["blocks"] = [sha256(payload[i:i + block_size]) for i in range(0, len(payload), block_size)]
+        shift += len(payload) - old_size
+
+    new_header = json.dumps(header, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    header_hash = sha256(new_header)
+    result = {"payloads_sha256": digests, "asar_header_sha256": header_hash}
+    if check_only:
+        return result
+    padded_size = (len(new_header) + 3) // 4 * 4
+    prefix = struct.pack("<IIII", 4, 8 + padded_size, 4 + padded_size, len(new_header))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staged_asar, staged_plist = output_dir / "app.asar", output_dir / "Info.plist"
+    if staged_asar.exists() or staged_plist.exists():
+        raise ValueError("Choose a fresh output directory")
+    with asar_path.open("rb") as source, staged_asar.open("xb") as target:
+        target.write(prefix + new_header.ljust(padded_size, b"\0"))
+        source.seek(payload_start)
+        for offset, (size, payload) in sorted(edits.items()):
+            copy_range(source, target, payload_start + offset - source.tell())
+            source.seek(size, 1)
+            target.write(payload)
+        shutil.copyfileobj(source, target)
+
+    plist_integrity["hash"] = header_hash
+    staged_plist.write_bytes(plistlib.dumps(info, sort_keys=False))
+    for entry, digest in digests.items():
+        verified_header, _, _, payload = read_packed_entry(staged_asar, entry)
+        if verified_header != new_header or sha256(payload) != digest:
+            raise ValueError(f"Staged ASAR integrity failed for {entry}")
+    return {"app_asar": str(staged_asar), "info_plist": str(staged_plist), **result}
+
+
 def patch_main(main):
     old = URL_PREFIX + SIZE_REWRITE
     new = URL_PREFIX + b" " * len(SIZE_REWRITE)
